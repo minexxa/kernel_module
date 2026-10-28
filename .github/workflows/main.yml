@@ -2,6 +2,11 @@ name: Build nft FIB modules
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - ".github/workflows/main.yml"
+
 concurrency:
   group: fib-${{ github.ref }}
   cancel-in-progress: true
@@ -14,54 +19,57 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 300
 
     steps:
-      - name: Checkout this repo (FIB out-of-tree sources)
+      - name: Checkout this repo
         uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential bc flex bison libssl-dev libelf-dev dwarves \
-            clang lld llvm git python3 rsync cpio
+            clang lld llvm git python3 rsync cpio pahole
 
       - name: Clone kernel tree (shallow)
         run: |
           git clone --depth=1 --single-branch -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
           echo "kernel HEAD: $(git -C kernel rev-parse --short HEAD)"
-          # free some space
           df -h
 
-      - name: Kernel config + modules_prepare
+      - name: Kernel config
         working-directory: kernel
         run: |
-          set -e
+          set -eux
           mkdir -p out
 
-          # Prefer GKI-style / existing defconfigs if present
           if [ -f arch/arm64/configs/gki_defconfig ]; then
             DEFCONFIG=gki_defconfig
           elif [ -f arch/arm64/configs/defconfig ]; then
             DEFCONFIG=defconfig
           else
-            # fallback: any *gki* defconfig
-            DEFCONFIG=$(ls arch/arm64/configs/*gki* 2>/dev/null | head -1 | xargs -n1 basename)
+            DEFCONFIG=$(basename "$(ls arch/arm64/configs/*gki* 2>/dev/null | head -1)")
           fi
-          echo "Using DEFCONFIG=$DEFCONFIG"
+          echo "DEFCONFIG=$DEFCONFIG"
 
-          # LLVM=1 is typical for Android 6.6 GKI; fall back to gcc cross if needed
-          make_k() { make ARCH=arm64 O=out LLVM=1 LLVM_IAS=1 "$@"; }
+          make ARCH=arm64 O=out LLVM=1 LLVM_IAS=1 "$DEFCONFIG"
 
-          if ! make_k "$DEFCONFIG"; then
-            echo "LLVM defconfig failed, trying without LLVM_IAS"
-            make ARCH=arm64 O=out LLVM=1 "$DEFCONFIG"
-          fi
-
-          # Enable nf_tables + FIB as modules (and minimal deps)
           CFG=out/.config
+          # Core netfilter + nf_tables as MODULES so FIB can link against their exports
           scripts/config --file "$CFG" \
+            --enable NETFILTER \
+            --enable NETFILTER_ADVANCED \
+            --enable NETFILTER_INGRESS \
+            --enable NETFILTER_EGRESS \
+            --enable NETFILTER_NETLINK \
+            --enable NF_CONNTRACK \
             --enable NF_TABLES \
             --enable NF_TABLES_INET \
             --enable NF_TABLES_IPV4 \
@@ -70,41 +78,56 @@ jobs:
             --module NFT_FIB_IPV4 \
             --module NFT_FIB_IPV6 \
             --module NFT_FIB_INET \
-            --module NFT_FIB_NETDEV \
-            --enable NETFILTER \
-            --enable NETFILTER_ADVANCED \
-            --enable IP_NF_IPTABLES \
-            --enable IP6_NF_IPTABLES || true
+            --module NFT_FIB_NETDEV
 
-          make_k olddefconfig
-          make_k modules_prepare
+          # Keep nf_tables itself as module (=m) so Module.symvers gets its exports
+          scripts/config --file "$CFG" --module NF_TABLES || true
+          scripts/config --file "$CFG" --enable NF_TABLES || true
 
-          # Ensure localversion / vermagic is visible
-          grep -E 'CONFIG_LOCALVERSION|CONFIG_MODVERSIONS' out/.config || true
+          # Faster CI: skip debug info bloat where possible
+          scripts/config --file "$CFG" \
+            --disable DEBUG_INFO \
+            --disable DEBUG_INFO_BTF \
+            --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
+            --set-val CONFIG_DEBUG_INFO_NONE y || true
 
-      - name: Build in-tree FIB modules
+          make ARCH=arm64 O=out LLVM=1 LLVM_IAS=1 olddefconfig
+
+          echo "== relevant config =="
+          grep -E 'CONFIG_NF_TABLES|CONFIG_NFT_FIB|CONFIG_MODVERSIONS|CONFIG_MODULES' out/.config | head -40
+
+      - name: Build kernel + Module.symvers (required for modpost)
         working-directory: kernel
         run: |
-          set -e
-          make_k() { make ARCH=arm64 O=out LLVM=1 LLVM_IAS=1 "$@"; }
+          set -eux
+          # modules_prepare alone is NOT enough — modpost needs a real Module.symvers
+          # from a kernel/modules build (exports nla_put, nft_register_expr, ...).
+          make ARCH=arm64 O=out LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare
 
-          # Build only the FIB objects via their directories
-          make_k M=net/netfilter modules
-          make_k M=net/ipv4/netfilter modules
-          make_k M=net/ipv6/netfilter modules
+          # Build vmlinux to populate core symbol versions
+          make ARCH=arm64 O=out LLVM=1 LLVM_IAS=1 -j"$(nproc)" vmlinux
 
-          echo "== produced ko (find) =="
-          find out -name 'nft_fib*.ko' -o -name 'nft_fib.ko' | tee /tmp/fib_kos.txt
-          # also search without out/ prefix for in-tree build paths
-          find . -name 'nft_fib*.ko' | tee -a /tmp/fib_kos.txt
+          # Build netfilter stack so nf_tables exports land in Module.symvers
+          make ARCH=arm64 O=out LLVM=1 LLVM_IAS=1 -j"$(nproc)" \
+            net/netfilter/ \
+            net/ipv4/netfilter/ \
+            net/ipv6/netfilter/ \
+            || true
 
-      - name: Collect artifacts
+          # Full modules pass for netfilter-related (ensures Module.symvers is complete)
+          make ARCH=arm64 O=out LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules
+
+          test -f out/Module.symvers
+          echo "Module.symvers lines: $(wc -l < out/Module.symvers)"
+          grep -E 'nft_register_expr|nft_chain_validate' out/Module.symvers | head || true
+          df -h
+
+      - name: Collect FIB .ko
         run: |
-          set -e
+          set -eux
           mkdir -p dist
-          # Prefer out-of-tree build location under O=out
           for n in nft_fib nft_fib_ipv4 nft_fib_ipv6 nft_fib_inet nft_fib_netdev; do
-            f=$(find kernel -name "${n}.ko" 2>/dev/null | head -1)
+            f=$(find kernel/out kernel -name "${n}.ko" 2>/dev/null | head -1 || true)
             if [ -n "$f" ]; then
               cp -v "$f" "dist/${n}.ko"
             else
@@ -112,24 +135,9 @@ jobs:
             fi
           done
           ls -la dist/
-          if [ ! -f dist/nft_fib.ko ]; then
-            echo "FATAL: nft_fib.ko not built"
-            # dump config related lines for debug
-            grep -i FIB kernel/out/.config || true
-            exit 1
-          fi
-          # record vermagic for the user
-          if command -v modinfo >/dev/null; then
-            modinfo dist/nft_fib.ko | tee dist/modinfo.txt || true
-          fi
-          strings dist/nft_fib.ko | grep -m1 vermagic= | tee dist/vermagic.txt || true
+          test -f dist/nft_fib.ko
+          test -f dist/nft_fib_ipv4.ko
+          test -f dist/nft_fib_ipv6.ko
+          test -f dist/nft_fib_inet.ko
 
-      - name: Upload .ko artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: nft-fib-ko
-          path: |
-            dist/*.ko
-            dist/*.txt
-          if-no-files-found: error
-          retention-days: 14
+          strings dist/nft_fib.ko | grep -m1 'vermagic=' | tee dist/verm
